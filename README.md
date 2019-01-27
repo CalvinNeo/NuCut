@@ -1,2 +1,4 @@
 # NuCut
-A graph partition system
+NuCut is a graph partition system.
+
+**Developing**
