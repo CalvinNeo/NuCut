@@ -32,3 +32,9 @@
 *.app
 
 dataset
+*.7z
+*.log
+kv
+*.swap
+test
+*.persist

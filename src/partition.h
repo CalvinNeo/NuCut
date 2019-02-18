@@ -1,3 +1,23 @@
+/*************************************************************************
+*  NuCut -- A streaming graph partitioning framework
+*  Copyright (C) 2018  Calvin Neo 
+*  Email: calvinneo@calvinneo.com;calvinneo1995@gmail.com
+*  Github: https://github.com/CalvinNeo/NuCut/
+*  
+*  This program is free software: you can redistribute it and/or modify
+*  it under the terms of the GNU General Public License as published by
+*  the Free Software Foundation, either version 3 of the License, or
+*  (at your option) any later version.
+*  
+*  This program is distributed in the hope that it will be useful,
+*  but WITHOUT ANY WARRANTY; without even the implied warranty of
+*  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+*  GNU General Public License for more details.
+*  
+*  You should have received a copy of the GNU General Public License
+*  along with this program.  If not, see <https://www.gnu.org/licenses/>.
+**************************************************************************/
+
 #pragma once
 
 #include <map>
@@ -13,6 +33,7 @@
 #include <limits>
 #include <cassert>
 #include <algorithm>
+#include <queue>
 #include <cmath>
 #include <condition_variable>
 
@@ -98,6 +119,7 @@ struct Partition{
 
 
 struct PartitionState{
+    virtual std::set<Edge> get_edges() const = 0;
     virtual int edges_size() const = 0;
     virtual Map<V, Vertex> get_verts() = 0;
     virtual Map<V, Vertex> get_verts(const Set<V> & vs) = 0;
@@ -204,44 +226,44 @@ struct Subpartitioner{
 
 };
 
+
+
 template<typename HeuristicFunction>
-struct MajorPartitioner{
+struct MajorPartitionerBase{
+public:
     PartitionConfig config;
-    Subpartitioner<HeuristicFunction> * subs;
     HeuristicFunction * select_partition;
 
-    ~MajorPartitioner(){
-        delete [] subs;
+    MajorPartitionerBase(PartitionConfig c, HeuristicFunction f): config(c), select_partition(f){
     }
-    MajorPartitioner(PartitionConfig c, HeuristicFunction f): config(c), select_partition(f){
-    }
-    void run(){
-        subs = new Subpartitioner<HeuristicFunction>[config.subp];
-        for(int i = 0; i < config.subp; i++){
-            subs[i].config = config;
-            subs[i].select_partition = select_partition;
-        }
-        printf("Run\n");
-        for(int i = 0; i < config.subp; i++){
-            subs[i].run();
-        }
-    }
-    void join(){
-        for(int i = 0; i < config.subp; i++){
-            subs[i].join();
-        }
-        for(int i = 0; i < config.k; i++){
-            std::vector<Partition> parts = config.state->get_parts();
-            printf("Partition[%d] edge size %u vertex size %u\n", i, parts[i].edges.size(), parts[i].get_verts().size());
-        }
-    }
+
+    virtual ~MajorPartitionerBase(){}
 
     double replicate_factor;
     double load_relative_stddev;
-    void assess(){
+    virtual void assess(){
+        int tote = 0, totv = 0;
+        std::vector<Partition> parts = config.state->get_parts();
+        std::map<Edge, int> edges_loc;
+        std::set<Edge> all_edges = config.state->get_edges();
+        for(int i = 0; i < config.k; i++){
+            tote += parts[i].edges.size();
+            totv += parts[i].get_verts().size();
+            printf("Partition[%d] edge size %u vertex size %u\n", i, parts[i].edges.size(), parts[i].get_verts().size());
+            for(auto && e: parts[i].edges){
+                if(edges_loc.find(e) != edges_loc.end()){
+                    printf("Duplicate edge [%lld,%lld], prev %lld, current %lld\n", e.u, e.v, edges_loc[e], i);
+                }
+                if(all_edges.find(e) == all_edges.end()){
+                    printf("Not-included edge [%lld,%lld], current %lld\n", e.u, e.v, i);
+                }
+                edges_loc[e] = i;
+            }
+        }
+        printf("Total edge %d, edges in partition %d\n", config.state->edges_size(), tote);
+        
         int total_replica = 0;
         Map<V, Vertex> verts = config.state->get_verts();
-        std::vector<Partition> parts = config.state->get_parts();
         for(const auto & pr: verts){
             const Vertex & vert = pr.second;
             total_replica += vert.parts.size();
@@ -254,4 +276,34 @@ struct MajorPartitioner{
         }
         load_relative_stddev = std::pow(sqr_sum / (config.k - 1), 0.5) / mean;
     }
+    virtual void run() = 0;
+    virtual void join() = 0;
 };
+
+template<typename HeuristicFunction>
+struct MajorPartitioner : public MajorPartitionerBase<HeuristicFunction>{
+    Subpartitioner<HeuristicFunction> * subs;
+
+    ~MajorPartitioner(){
+        delete [] subs;
+    }
+    MajorPartitioner(PartitionConfig c, HeuristicFunction f): MajorPartitionerBase<HeuristicFunction>(c, f){
+    }
+    virtual void run() override{
+        subs = new Subpartitioner<HeuristicFunction>[this->config.subp];
+        for(int i = 0; i < this->config.subp; i++){
+            subs[i].config = this->config;
+            subs[i].select_partition = this->select_partition;
+        }
+        printf("Run\n");
+        for(int i = 0; i < this->config.subp; i++){
+            subs[i].run();
+        }
+    }
+    virtual void join() override{
+        for(int i = 0; i < this->config.subp; i++){
+            subs[i].join();
+        }
+    }
+};
+
