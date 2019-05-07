@@ -21,10 +21,8 @@
 #pragma once
 #include "partition.h"
 
-template<typename HeuristicFunction>
 struct SubpartitionerAsync{
     PartitionConfig config;
-    HeuristicFunction * select_partition;
     std::thread * ths;
     std::vector<Partition> parts;
     std::queue<std::pair<P, Edge>> out_queue;
@@ -65,16 +63,6 @@ struct SubpartitionerAsync{
         printf("Thread Finished.\n");
     }
 
-    // void merge_from_delta(const std::vector<std::vector<Partition>> & delta_p){
-    //     for(auto && dp: delta_p){
-    //         for(int i = 0; i < config.k; i++){
-    //             for(int j = 0; j < dp[i].edges.size(); j++){
-    //                 parts[i].add_edge(dp[i].edges[j]);
-    //             }
-    //         }
-    //     }
-    // }
-
     void partition_with_window(const Set<Edge> & window, const Set<V> & vs){
         // NOTICE We should fetch a copy rather than a reference. To avoid sync problems.
         Map<V, Vertex> verts = config.state->get_verts(vs);
@@ -84,6 +72,7 @@ struct SubpartitionerAsync{
         }
         acc_window++;
 
+        uint64_t start_time = get_current_ms();
         printf("vs.size() = %u, parts.size() = %u.\n", vs.size(), parts.size());
         for(const Edge & e: window){
             Vertex & u = verts[e.u];
@@ -93,13 +82,14 @@ struct SubpartitionerAsync{
             u.delta_deg++;
             v.delta_deg++;
 
-            printf("Select partition Edge{%lld, %lld}\n", e.u, e.v);
-            P p = select_partition(u, v, parts);
+            printf("---\nSelect partition Edge{%lld, %lld}\n", e.u, e.v);
+            P p = config.hf(u, v, parts);
             assert(p != -1);
             // If u/v is already related to p, the following stmt changes nothing.
             u.add_part(p);
             v.add_part(p);
             // If e is already related to p, the following stmt changes nothing
+            config.state->check_crashed();
             printf("Assign Edge{%lld, %lld} to %lld. Prev size %u\n", e.u, e.v, p, parts[p].edges.size());
             parts[p].add_edge(e);
             out_queue.push(std::make_pair(p, e));
@@ -110,6 +100,12 @@ struct SubpartitionerAsync{
         config.state->put_verts(verts);
         // We do not put_parts
         // config.state->put_parts(parts);
+        uint64_t end_time = get_current_ms();
+        #if defined(COMPUTE_OVERHEAD)
+        fprintf(config.ds->f, "%d %d %llu\n", -1, window.size(), end_time - start_time);
+        update_max(config.ds->max_t, end_time - start_time);
+        update_min(config.ds->min_t, end_time - start_time);
+        #endif
         printf("partition_with_window end.\n");
     }
 
@@ -125,39 +121,54 @@ struct SubpartitionerAsync{
 
 };
 
-template<typename HeuristicFunction>
-struct MajorPartitionerAsync : public MajorPartitionerBase<HeuristicFunction>{
-    SubpartitionerAsync<HeuristicFunction> * subs;
-    std::vector<std::thread *> ths;
+struct MajorPartitionerAsync : public MajorPartitionerBase{
+    SubpartitionerAsync * subs;
+    std::vector<std::thread *> thsq;
+    // std::thread * tq;
     bool stop = false;
 
     ~MajorPartitionerAsync(){
         delete [] subs;
     }
-    MajorPartitionerAsync(PartitionConfig c, HeuristicFunction f): MajorPartitionerBase<HeuristicFunction>(c, f){
+    MajorPartitionerAsync(PartitionConfig c): MajorPartitionerBase(c){
     }
     virtual void run() override{
-        subs = new SubpartitionerAsync<HeuristicFunction>[this->config.subp];
-        ths.resize(this->config.subp);
+        subs = new SubpartitionerAsync[this->config.subp];
+        thsq.resize(this->config.subp);
         for(int i = 0; i < this->config.subp; i++){
             subs[i].config = this->config;
-            subs[i].select_partition = this->select_partition;
         }
         for(int i = 0; i < this->config.subp; i++){
             assert(i < this->config.subp);
-            ths[i] = new std::thread([this, cid=i, subs=subs](){
-                while(!stop){
+            thsq[i] = new std::thread([this, cid=i, subs=subs](){
+                do{
                     std::vector<Partition> dp;
                     dp.resize(this->config.k);
                     while(subs[cid].out_queue.size()){
                         std::pair<P, Edge> pr = subs[cid].out_queue.front();
                         subs[cid].out_queue.pop();
+                        // NOTICE Need protect??
                         dp[pr.first].add_edge(pr.second);
                     }
+                    this->config.state->check_crashed();
                     this->config.state->put_parts(dp);
-                }
+                } while(!stop);
             });
         }
+        // tq = new std::thread([this, subs=subs](){
+        //     do{
+        //         std::vector<Partition> dp;
+        //         dp.resize(this->config.k);
+        //         for(int cid = 0; cid < this->config.subp; cid++){
+        //             while(subs[cid].out_queue.size()){
+        //                 std::pair<P, Edge> pr = subs[cid].out_queue.front();
+        //                 subs[cid].out_queue.pop();
+        //                 dp[pr.first].add_edge(pr.second);
+        //             }
+        //         }
+        //         this->config.state->put_parts(dp);
+        //     } while(!stop);
+        // });
         printf("Run\n");
         for(int i = 0; i < this->config.subp; i++){
             subs[i].run();
@@ -168,12 +179,16 @@ struct MajorPartitionerAsync : public MajorPartitionerBase<HeuristicFunction>{
             subs[i].join();
         }
         stop = true;
-        for(auto && t: ths){
+        for(auto && t: thsq){
             if(t->joinable()){
                 t->join();
             }
             delete t;
         }
-        ths.clear();
+        thsq.clear();
+        // if(tq->joinable()){
+        //     tq->join();
+        // }
+        // delete tq;
     }
 };

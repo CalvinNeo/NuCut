@@ -38,3 +38,7 @@ kv
 *.swap
 test
 *.persist
+*.perf
+*.txt
+core
+read_persist

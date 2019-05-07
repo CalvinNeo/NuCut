@@ -19,133 +19,10 @@
 **************************************************************************/
 
 #pragma once
+#include "partition_def.h"
 
-#include <map>
-#include <vector>
-#include <unordered_map>
-#include <set>
-#include <unordered_set>
-#include <cstring>
-#include <cstdlib>
-#include <atomic>
-#include <thread>
-#include <mutex>
-#include <limits>
-#include <cassert>
-#include <algorithm>
-#include <queue>
-#include <cmath>
-#include <condition_variable>
-
-
-typedef long long LL;
-typedef LL E; // Index for edge
-typedef LL V; // Index for vertex
-typedef LL P; // Index for partition
-template <typename K, typename V>
-using Map = std::map<K, V>;
-template <typename T>
-using Set = std::set<T>;
-
-struct Vertex{
-    std::atomic<int> deg;
-    // Use to sync with shared state by delta
-    int delta_deg;
-    // TODO Need protecting.
-    // All partitions which related to me.
-    Set<P> parts;
-
-    void add_part(P p){
-        // Add a partition that related to me.
-        parts.insert(p);
-    }
-    Vertex(){
-        deg.store(0);
-        delta_deg = 0;
-    }
-    Vertex(const Vertex & r){
-        deg.store(r.deg.load());
-        delta_deg = r.delta_deg;
-        parts = r.parts;
-    }
-    Vertex & operator=(const Vertex & r){
-        if(&r == this){
-            return *this;
-        }
-        deg.store(r.deg.load());
-        delta_deg = r.delta_deg;
-        parts = r.parts;
-        return *this;
-    }
-};
-
-struct Edge{
-    V u;
-    V v;
-    Edge(V uu, V vv){
-        if(uu > vv){
-            std::swap(uu, vv);
-        }
-        u = uu;
-        v = vv;
-    }
-    bool operator==(const Edge & r) const{
-        if(&r == this) return true;
-        return u == r.u && v == r.v;
-    }
-    bool operator<(const Edge & r) const {
-        if(u == r.u) {
-            return v < r.v;
-        }
-        return u < r.u;
-    }
-};
-
-struct Partition{
-    void add_edge(const Edge & e){
-        // NOTICE This function should be idempotent.
-        edges.insert(e);
-    }
-    Set<V> get_verts(){
-        Set<V> verts;
-        for(const Edge & edge: edges){
-            verts.insert(edge.u);
-            verts.insert(edge.v);
-        }
-        return verts;
-    }
-    Set<Edge> edges;
-};
-
-
-struct PartitionState{
-    virtual std::set<Edge> get_edges() const = 0;
-    virtual int edges_size() const = 0;
-    virtual Map<V, Vertex> get_verts() = 0;
-    virtual Map<V, Vertex> get_verts(const Set<V> & vs) = 0;
-    virtual std::vector<Partition> get_parts() = 0;
-    virtual void put_verts(const Map<V, Vertex> & delta) = 0;
-    virtual void put_part(P i, const Partition & delta_part) = 0;
-    virtual void put_parts(const std::vector<Partition> & delta) = 0;
-
-    virtual Edge get_edge(bool & valid) = 0;
-    virtual ~PartitionState(){
-
-    }
-};
-
-struct PartitionConfig {
-    int k; // How many partitions
-    int window;
-    int subp; // How many subpartitions
-    std::string dataset;
-    PartitionState * state;
-};
-
-template<typename HeuristicFunction>
 struct Subpartitioner{
     PartitionConfig config;
-    HeuristicFunction * select_partition;
     std::thread * ths;
 
     ~Subpartitioner(){
@@ -184,6 +61,7 @@ struct Subpartitioner{
 
     void partition_with_window(const Set<Edge> & window, const Set<V> & vs){
         // NOTICE We should fetch a copy rather than a reference. To avoid sync problems.
+        uint64_t start_time = get_current_ms();
         Map<V, Vertex> verts = config.state->get_verts(vs);
         std::vector<Partition> parts = config.state->get_parts();
 
@@ -197,7 +75,7 @@ struct Subpartitioner{
             v.delta_deg++;
 
             printf("Select partition Edge{%lld, %lld}\n", e.u, e.v);
-            P p = select_partition(u, v, parts);
+            P p = config.hf(u, v, parts);
             assert(p != -1);
             // If u/v is already related to p, the following stmt changes nothing.
             u.add_part(p);
@@ -211,7 +89,18 @@ struct Subpartitioner{
         // We can just simply merge them.
         config.state->put_verts(verts);
         config.state->put_parts(parts);
-        printf("partition_with_window end.\n");
+        uint64_t end_time = get_current_ms();
+        #if defined(COMPUTE_OVERHEAD)
+            int pk = 0;
+            for(P i = 0; i < parts.size(); i++){
+                pk += parts[i].edges.size();
+                config.ds->total_e.fetch_add(pk);
+            }
+            config.ds->useful_e.fetch_add(window.size());
+            fprintf(config.ds->f, "%d %d %llu\n", pk, window.size(), end_time - start_time);
+            update_max(config.ds->max_t, end_time - start_time);
+            update_min(config.ds->min_t, end_time - start_time);
+        #endif
     }
 
     void run(){
@@ -227,14 +116,11 @@ struct Subpartitioner{
 };
 
 
-
-template<typename HeuristicFunction>
 struct MajorPartitionerBase{
 public:
     PartitionConfig config;
-    HeuristicFunction * select_partition;
 
-    MajorPartitionerBase(PartitionConfig c, HeuristicFunction f): config(c), select_partition(f){
+    MajorPartitionerBase(PartitionConfig c): config(c){
     }
 
     virtual ~MajorPartitionerBase(){}
@@ -250,17 +136,42 @@ public:
             tote += parts[i].edges.size();
             totv += parts[i].get_verts().size();
             printf("Partition[%d] edge size %u vertex size %u\n", i, parts[i].edges.size(), parts[i].get_verts().size());
+            fprintf(config.ds->f, "Partition[%d] edge size %u vertex size %u\n", i, parts[i].edges.size(), parts[i].get_verts().size());
             for(auto && e: parts[i].edges){
                 if(edges_loc.find(e) != edges_loc.end()){
-                    printf("Duplicate edge [%lld,%lld], prev %lld, current %lld\n", e.u, e.v, edges_loc[e], i);
+                    printf("Duplicate edge [%lld, %lld], prev %lld, current %lld\n", e.u, e.v, edges_loc[e], i);
+                    fprintf(config.ds->f, "Duplicate edge [%lld, %lld], prev %lld, current %lld\n", e.u, e.v, edges_loc[e], i);
                 }
                 if(all_edges.find(e) == all_edges.end()){
-                    printf("Not-included edge [%lld,%lld], current %lld\n", e.u, e.v, i);
+                    printf("Invalid edge [%lld, %lld], current %lld\n", e.u, e.v, i);
+                    fprintf(config.ds->f, "Invalid edge [%lld, %lld], current %lld\n", e.u, e.v, i);
                 }
                 edges_loc[e] = i;
             }
         }
+        for (auto && e: all_edges)
+        {
+            bool ex = false;
+            for(int i = 0; i < config.k; i++){
+                if(parts[i].edges.find(e) == parts[i].edges.end()){
+                    continue;
+                }else{
+                    ex = true;
+                    break;
+                }
+            }
+            if(!ex){
+                printf("Missing edge [%lld, %lld]\n", e.u, e.v);
+                fprintf(config.ds->f, "Missing edge [%lld, %lld]\n", e.u, e.v);
+            }
+        }
         printf("Total edge %d, edges in partition %d\n", config.state->edges_size(), tote);
+        fprintf(config.ds->f, "Total edge %d, edges in partition %d\n", config.state->edges_size(), tote);
+        
+        printf("Max Time %d, Min Time %d D %d\n", config.ds->max_t.load(), config.ds->min_t.load(), 
+            config.ds->max_t.load() - config.ds->min_t.load());
+        fprintf(config.ds->f, "Max Time %d, Min Time %d D %d\n", config.ds->max_t.load(), 
+            config.ds->min_t.load(), config.ds->max_t.load() - config.ds->min_t.load());
         
         int total_replica = 0;
         Map<V, Vertex> verts = config.state->get_verts();
@@ -280,20 +191,20 @@ public:
     virtual void join() = 0;
 };
 
-template<typename HeuristicFunction>
-struct MajorPartitioner : public MajorPartitionerBase<HeuristicFunction>{
-    Subpartitioner<HeuristicFunction> * subs;
+struct MajorPartitioner : public MajorPartitionerBase{
+    Subpartitioner * subs;
 
     ~MajorPartitioner(){
         delete [] subs;
     }
-    MajorPartitioner(PartitionConfig c, HeuristicFunction f): MajorPartitionerBase<HeuristicFunction>(c, f){
+    MajorPartitioner(PartitionConfig c): MajorPartitionerBase(c){
     }
     virtual void run() override{
-        subs = new Subpartitioner<HeuristicFunction>[this->config.subp];
+        this->config.ds->total_e.store(0);
+        this->config.ds->useful_e.store(0);
+        subs = new Subpartitioner[this->config.subp];
         for(int i = 0; i < this->config.subp; i++){
             subs[i].config = this->config;
-            subs[i].select_partition = this->select_partition;
         }
         printf("Run\n");
         for(int i = 0; i < this->config.subp; i++){
@@ -304,6 +215,7 @@ struct MajorPartitioner : public MajorPartitionerBase<HeuristicFunction>{
         for(int i = 0; i < this->config.subp; i++){
             subs[i].join();
         }
+        printf("total_e %d, useful_e %d\n", this->config.ds->total_e.load(), this->config.ds->useful_e.load());
     }
 };
 

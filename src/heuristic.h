@@ -18,6 +18,7 @@
 *  along with this program.  If not, see <https://www.gnu.org/licenses/>.
 **************************************************************************/
 
+#pragma once
 #include "partition.h"
 
 inline std::vector<double> evaluate_partition_greedy(const Vertex & u, const Vertex & v, const std::vector<Partition> & parts){
